@@ -13,6 +13,7 @@ describe("wizardDraft", () => {
     selectedCreditLine: {
       id: "cl_1",
       name: "Line 1",
+      status: "Active",
       limit: 1000,
       available: 1000,
       utilization: 0,

@@ -113,7 +113,7 @@ describe("DrawCreditPage — step navigation & token audit", () => {
       screen.getByRole("heading", { name: /select credit line/i }),
     ).toBeInTheDocument();
 
-    // Mock data has 3 credit lines; each is a button with an aria-label
+    // Mock data includes active and frozen lines; each is a button with an aria-label
     expect(
       screen.getByRole("button", {
         name: /select business line of credit/i,

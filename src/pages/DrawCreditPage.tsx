@@ -28,7 +28,7 @@
  *     a meaningful visual fallback rather than a frozen rotation frame.
  */
 
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import { Skeleton } from "@/components/Skeleton";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useReducedMotion } from "@/context/ReducedMotionContext";
@@ -51,6 +51,11 @@ import { LiveRegion } from "@/components/LiveRegion";
 import { CreditLine, DrawStep, Transaction } from "@/types/draw-credit.types";
 import { mockCreditLines } from "@/lib/draw-credit-mock-data";
 import { normalizeCreditLineAvailability } from "@/lib/credit-line-availability";
+import {
+  DRAW_INELIGIBILITY_REASON_LABELS,
+  getDrawEligibility,
+  type DrawIneligibilityReason,
+} from "@/lib/draw-eligibility";
 import { getDrawAmountValidation } from "@/utils/amountValidation";
 import { offlineMutation } from "@/utils/offline";
 import { useOnline } from "@/hooks/useOnline";
@@ -126,18 +131,32 @@ export default function DrawCreditPage() {
 
   const { queueAction } = useOnline();
   const routeTransaction = location.state?.transaction as Transaction | undefined;
-  const draftState = routeTransaction ? null : loadDraft();
+  const draftState = useMemo(
+    () => (routeTransaction ? null : loadDraft()),
+    [routeTransaction],
+  );
+  // A restored draft may reference a line that has since become Suspended,
+  // Defaulted, Frozen, Closed or fully drawn. Never resume such a draft.
+  const restoredDraft = useMemo(() => {
+    if (!draftState) return null;
+    if (!draftState.selectedCreditLine) return draftState;
+
+    const normalizedLine = normalizeCreditLineAvailability(
+      draftState.selectedCreditLine,
+    );
+    return getDrawEligibility(normalizedLine).eligible ? draftState : null;
+  }, [draftState]);
 
   const [step, setStep] = useState<DrawStep>(
-    routeTransaction ? "status" : draftState?.step ?? "select",
+    routeTransaction ? "status" : restoredDraft?.step ?? "select",
   );
   const [selectedCreditLine, setSelectedCreditLine] =
     useState<CreditLine | null>(
-      draftState?.selectedCreditLine
-        ? normalizeCreditLineAvailability(draftState.selectedCreditLine)
+      restoredDraft?.selectedCreditLine
+        ? normalizeCreditLineAvailability(restoredDraft.selectedCreditLine)
         : null,
     );
-  const [amount, setAmount] = useState(draftState?.amount ?? 0);
+  const [amount, setAmount] = useState(restoredDraft?.amount ?? 0);
 
   useEffect(() => {
     if (step === "status") {
@@ -146,6 +165,14 @@ export default function DrawCreditPage() {
       saveDraft({ step, selectedCreditLine, amount });
     }
   }, [step, selectedCreditLine, amount]);
+
+  // Remove the rejected draft after the save effect above, so a stale
+  // ineligible line cannot be picked up again on the next visit.
+  useEffect(() => {
+    if (draftState && !restoredDraft) {
+      clearDraft();
+    }
+  }, [draftState, restoredDraft]);
 
   const [isLoading, setIsLoading] = useState(false);
   /**
@@ -165,6 +192,8 @@ export default function DrawCreditPage() {
   );
   const [confirmationAcknowledged, setConfirmationAcknowledged] =
     useState(false);
+  const [eligibilityAlert, setEligibilityAlert] =
+    useState<DrawIneligibilityReason | null>(null);
 
   const { debouncedAnnouncement: microProgressAnnouncement } =
     useDrawWizardMicroProgress({
@@ -183,11 +212,13 @@ export default function DrawCreditPage() {
     setSelectedCreditLine(normalizeCreditLineAvailability(creditLine));
     setAmount(0);
     setConfirmationAcknowledged(false);
+    setEligibilityAlert(null);
     setStep("amount");
   };
 
   const handleAmountNext = (selectedAmount: number) => {
     setAmount(selectedAmount);
+    setEligibilityAlert(null);
     setStep("confirm");
   };
 
@@ -203,6 +234,20 @@ export default function DrawCreditPage() {
     // State-transition invariant: only the confirm step may submit, and it
     // requires a credit line and a positive amount.
     if (step !== "confirm" || !line || amount <= 0) return;
+
+    // Re-check eligibility against the latest line data (status may have
+    // changed while the user was entering an amount). Never submit a draw
+    // against Suspended, Defaulted, Frozen, Closed or fully drawn lines.
+    const latestLine =
+      mockCreditLines.find((candidate) => candidate.id === line.id) ?? line;
+    const latestEligibility = getDrawEligibility(
+      normalizeCreditLineAvailability(latestLine),
+    );
+    if (!latestEligibility.eligible) {
+      setEligibilityAlert(latestEligibility.reason);
+      return;
+    }
+    setEligibilityAlert(null);
 
     // Submit-time validation (defense in depth). The amount step guards user
     // input, but re-validating here ensures an out-of-bounds amount restored
@@ -270,6 +315,7 @@ export default function DrawCreditPage() {
     setSelectedCreditLine(null);
     setAmount(0);
     setConfirmationAcknowledged(false);
+    setEligibilityAlert(null);
     setTransaction(null);
   };
 
@@ -278,9 +324,11 @@ export default function DrawCreditPage() {
       setStep("select");
       setSelectedCreditLine(null);
       setConfirmationAcknowledged(false);
+      setEligibilityAlert(null);
     } else if (step === "confirm") {
       setStep("amount");
       setConfirmationAcknowledged(false);
+      setEligibilityAlert(null);
     }
   }, [step]);
 
@@ -431,6 +479,17 @@ export default function DrawCreditPage() {
 
           {step === "confirm" && selectedCreditLine && (
             <>
+              {eligibilityAlert && (
+                <div
+                  className="dc-eligibility-alert"
+                  role="alert"
+                  aria-live="assertive"
+                >
+                  <strong>This credit line can no longer be drawn from.</strong>{" "}
+                  {DRAW_INELIGIBILITY_REASON_LABELS[eligibilityAlert]}. Please
+                  choose another line before submitting.
+                </div>
+              )}
               <ConfirmationStep
                 creditLine={selectedCreditLine}
                 amount={amount}
