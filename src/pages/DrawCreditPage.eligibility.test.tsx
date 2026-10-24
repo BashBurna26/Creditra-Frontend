@@ -1,10 +1,17 @@
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import DrawCreditPage from "./DrawCreditPage";
-import { mockCreditLines, createCreditLine } from "@/lib/draw-credit-mock-data";
+import { mockCreditLines } from "@/lib/draw-credit-mock-data";
 import { loadDraft, saveDraft } from "@/state/wizardDraft";
 import { __setMockLocation } from "react-router-dom";
+
+// The wizard reads the connected wallet to scope its persisted draft. These
+// tests render the page without a WalletProvider.
+vi.mock("@/context/WalletContext", () => ({
+  useWallet: () => ({ wallet: null }),
+  walletIdentityKey: () => null,
+}));
 
 const activeMock = mockCreditLines.find((line) => line.id === "cl-001")!;
 
@@ -54,21 +61,10 @@ describe("DrawCreditPage — draw eligibility", () => {
   });
 
   it("discards a restored draft that references a Defaulted line", () => {
-    const defaultedLine = createCreditLine({
-      id: "cl-defaulted",
-      name: "Defaulted Line",
-      status: "Defaulted",
-      limit: 10_000,
-      utilization: 20,
-      riskBand: "Watch",
-      termMonths: 12,
-    });
+    // The draft references a line that has since become Defaulted.
+    activeMock.status = "Defaulted";
 
-    saveDraft({
-      step: "amount",
-      selectedCreditLine: defaultedLine,
-      amount: 100,
-    });
+    saveDraft({ step: "amount", lineId: activeMock.id, amountCents: 10_000 }, null);
 
     render(<DrawCreditPage />);
 

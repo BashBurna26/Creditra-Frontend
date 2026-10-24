@@ -28,11 +28,18 @@
  *     a meaningful visual fallback rather than a frozen rotation frame.
  */
 
-import { useRef, useState, useEffect, useCallback, useMemo } from "react";
+import { useRef, useState, useEffect, useCallback } from "react";
 import { Skeleton } from "@/components/Skeleton";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useReducedMotion } from "@/context/ReducedMotionContext";
-import { loadDraft, saveDraft, clearDraft } from "@/state/wizardDraft";
+import {
+  loadDraft,
+  saveDraft,
+  clearDraft,
+  type WizardDraftState,
+} from "@/state/wizardDraft";
+import { useWallet, walletIdentityKey } from "@/context/WalletContext";
+import { getStoredWallet, isWalletRemembered } from "@/utils/wallet";
 import { readJson, writeJson } from "@/utils/storage";
 import {
   DEFAULT_RISK_ACK_KEY,
@@ -56,7 +63,10 @@ import {
   getDrawEligibility,
   type DrawIneligibilityReason,
 } from "@/lib/draw-eligibility";
+import { classifyDrawError, type DrawErrorKind } from "@/lib/draw-errors";
 import { getDrawAmountValidation } from "@/utils/amountValidation";
+import { getDrawPricingQuote } from "@/lib/draw-credit-pricing";
+import { projectDraw } from "@/lib/draw-projection";
 import { offlineMutation } from "@/utils/offline";
 import { useOnline } from "@/hooks/useOnline";
 import { WhyApr } from "@/components/WhyApr";
@@ -74,6 +84,18 @@ const drawSteps = [
 ] as const;
 
 type ProgressStep = (typeof drawSteps)[number]["id"];
+
+interface RestoredDraft {
+  draft: WizardDraftState | null;
+  line: CreditLine | null;
+  notice: string;
+}
+
+const EMPTY_RESTORED_DRAFT: RestoredDraft = {
+  draft: null,
+  line: null,
+  notice: "",
+};
 
 /** Returns true if the currently focused element can receive text input. */
 function isFocusedOnInput(): boolean {
@@ -149,49 +171,123 @@ export default function DrawCreditPage() {
   }, []);
 
   const { queueAction } = useOnline();
+  const { wallet } = useWallet();
+  // Auto-reconnect starts after the first render, so fall back to the
+  // remembered wallet during that window. Without this, a draft saved by the
+  // remembered wallet would look foreign to the initial `null` identity and be
+  // discarded before reconnection completes. The owner-change effect still
+  // clears it if a different wallet connects.
+  const rememberedWallet = isWalletRemembered() ? getStoredWallet() : null;
+  const draftOwner = walletIdentityKey(wallet ?? rememberedWallet);
   const routeTransaction = location.state?.transaction as Transaction | undefined;
-  const draftState = useMemo(
-    () => (routeTransaction ? null : loadDraft()),
-    [routeTransaction],
-  );
-  // A restored draft may reference a line that has since become Suspended,
-  // Defaulted, Frozen, Closed or fully drawn. Never resume such a draft.
-  const restoredDraft = useMemo(() => {
-    if (!draftState) return null;
-    if (!draftState.selectedCreditLine) return draftState;
 
-    const normalizedLine = normalizeCreditLineAvailability(
-      draftState.selectedCreditLine,
-    );
-    return getDrawEligibility(normalizedLine).eligible ? draftState : null;
-  }, [draftState]);
+  /**
+   * Resolve a persisted draft exactly once, at mount.
+   *
+   * The stored line id is re-resolved against the current line data rather
+   * than trusting a snapshot. A missing or fully-drawn line discards the
+   * draft and leaves an informational note instead of opening a stale flow.
+   */
+  const [restoredDraft] = useState<RestoredDraft>(() => {
+    if (routeTransaction) return EMPTY_RESTORED_DRAFT;
 
-  const [step, setStep] = useState<DrawStep>(
-    routeTransaction ? "status" : restoredDraft?.step ?? "select",
-  );
-  const [selectedCreditLine, setSelectedCreditLine] =
-    useState<CreditLine | null>(
-      restoredDraft?.selectedCreditLine
-        ? normalizeCreditLineAvailability(restoredDraft.selectedCreditLine)
-        : null,
+    const draft = loadDraft(draftOwner);
+    if (!draft) return EMPTY_RESTORED_DRAFT;
+
+    if (draft.step === "select") {
+      return { draft, line: null, notice: "" };
+    }
+
+    const line = mockCreditLines.find(
+      (candidate) => candidate.id === draft.lineId,
     );
-  const [amount, setAmount] = useState(restoredDraft?.amount ?? 0);
+
+    if (!line) {
+      clearDraft();
+      return {
+        draft: null,
+        line: null,
+        notice:
+          "Your saved draw draft was discarded because that credit line is no longer available.",
+      };
+    }
+
+    // A restored draft may reference a line that has since become Suspended,
+    // Defaulted, Frozen, Closed or fully drawn. Never resume such a draft.
+    const normalizedLine = normalizeCreditLineAvailability(line);
+    if (!getDrawEligibility(normalizedLine).eligible) {
+      clearDraft();
+      return {
+        draft: null,
+        line: null,
+        notice:
+          "Your saved draw draft was discarded because that credit line is no longer eligible for a draw.",
+      };
+    }
+
+    // Even if the stored step were ever tampered with, an amount-step draft
+    // can never land on confirm: the user always re-reviews current pricing.
+    return { draft, line: normalizedLine, notice: "" };
+  });
+
+  const [draftNotice, setDraftNotice] = useState(restoredDraft.notice);
+  const [step, setStep] = useState<DrawStep>(() => {
+    if (routeTransaction) return "status";
+    return restoredDraft.draft?.step === "amount" && restoredDraft.line
+      ? "amount"
+      : "select";
+  });
+  const [selectedCreditLine, setSelectedCreditLine] = useState<CreditLine | null>(
+    restoredDraft.line,
+  );
+  const [amount, setAmount] = useState(() =>
+    restoredDraft.draft?.step === "amount"
+      ? restoredDraft.draft.amountCents / 100
+      : 0,
+  );
+
+  // Drafts belong to the wallet identity that created them. Clear the
+  // persisted draft when the wallet disconnects or switches accounts, and skip
+  // the save effect for the commit that observed the change so the old flow is
+  // not immediately re-persisted under the new owner.
+  const previousDraftOwner = useRef(draftOwner);
+  const skipNextDraftSave = useRef(false);
+
+  useEffect(() => {
+    if (previousDraftOwner.current === draftOwner) return;
+
+    previousDraftOwner.current = draftOwner;
+    clearDraft();
+    skipNextDraftSave.current = true;
+    setDraftNotice(
+      draftOwner
+        ? "Your saved draw draft was cleared because the wallet changed."
+        : "Your saved draw draft was cleared because the wallet disconnected.",
+    );
+  }, [draftOwner]);
 
   useEffect(() => {
     if (step === "status") {
       clearDraft();
-    } else {
-      saveDraft({ step, selectedCreditLine, amount });
+      return;
     }
-  }, [step, selectedCreditLine, amount]);
 
-  // Remove the rejected draft after the save effect above, so a stale
-  // ineligible line cannot be picked up again on the next visit.
-  useEffect(() => {
-    if (draftState && !restoredDraft) {
-      clearDraft();
+    if (skipNextDraftSave.current) {
+      skipNextDraftSave.current = false;
+      return;
     }
-  }, [draftState, restoredDraft]);
+
+    saveDraft(
+      {
+        // Persist the confirm step as its preceding amount step so a reload
+        // always re-enters at the last reviewable position.
+        step: step === "confirm" ? "amount" : step,
+        lineId: selectedCreditLine?.id ?? null,
+        amountCents: Math.round(amount * 100),
+      },
+      draftOwner,
+    );
+  }, [step, selectedCreditLine, amount, draftOwner]);
 
   const [isLoading, setIsLoading] = useState(false);
   /**
@@ -209,6 +305,7 @@ export default function DrawCreditPage() {
   const [transaction, setTransaction] = useState<Transaction | null>(
     routeTransaction ?? null,
   );
+  const [errorKind, setErrorKind] = useState<DrawErrorKind | undefined>(undefined);
   const [confirmationAcknowledged, setConfirmationAcknowledged] =
     useState(false);
   const [eligibilityAlert, setEligibilityAlert] =
@@ -275,7 +372,16 @@ export default function DrawCreditPage() {
     // from a wizard draft can never be silently submitted.
     const validation = getDrawAmountValidation(String(amount), line);
     if (!validation.isValid) {
-      setSubmitError(validation.message);
+      setSubmitError(validation.feedback.message);
+      return;
+    }
+    const projection = projectDraw(
+      line,
+      amount,
+      getDrawPricingQuote(line, amount),
+    );
+    if (projection.exceedsLimit) {
+      setSubmitError("This draw exceeds the credit line limit after the 1% fee.");
       return;
     }
 
@@ -303,6 +409,7 @@ export default function DrawCreditPage() {
           };
 
           setTransaction(newTransaction);
+          setErrorKind(succeeded ? undefined : classifyDrawError(newTransaction));
           setIsLoading(false);
           setStep("status");
 
@@ -341,8 +448,25 @@ export default function DrawCreditPage() {
     setConfirmationAcknowledged(false);
     setEligibilityAlert(null);
     setTransaction(null);
+    setErrorKind(undefined);
     setSubmitError(null);
   };
+
+  const handleRetry = useCallback(() => {
+    if (!selectedCreditLine) {
+      setStep("select");
+      return;
+    }
+    setConfirmationAcknowledged(false);
+    setTransaction(null);
+    setErrorKind(undefined);
+    const validation = getDrawAmountValidation(String(amount), selectedCreditLine);
+    if (!validation.isValid) {
+      setStep("amount");
+      return;
+    }
+    setStep("confirm");
+  }, [selectedCreditLine, amount]);
 
   const handleBack = useCallback(() => {
     if (step === "amount") {
@@ -350,14 +474,11 @@ export default function DrawCreditPage() {
       setSelectedCreditLine(null);
       setConfirmationAcknowledged(false);
       setEligibilityAlert(null);
-    } else if (step === "confirm") {
-      setStep("amount");
-      setConfirmationAcknowledged(false);
-      setEligibilityAlert(null);
       setSubmitError(null);
     } else if (step === "confirm") {
       setStep("amount");
       setConfirmationAcknowledged(false);
+      setEligibilityAlert(null);
       setSubmitError(null);
     }
   }, [step]);
@@ -471,6 +592,11 @@ export default function DrawCreditPage() {
           <h2 ref={stepHeadingRef} tabIndex={-1} className="sr-only">
             Draw credit step
           </h2>
+          {draftNotice && (
+            <p className="dc-draft-notice" role="status">
+              {draftNotice}
+            </p>
+          )}
           {step === "select" && (
             <>
               <CreditLineSelector
@@ -497,6 +623,7 @@ export default function DrawCreditPage() {
               <AmountInput
                 ref={amountInputRef}
                 creditLine={selectedCreditLine}
+                initialAmount={amount}
                 onAmountChange={setAmount}
                 onNext={handleAmountNext}
                 onBack={handleBack}
@@ -678,6 +805,8 @@ export default function DrawCreditPage() {
                 <TransactionStatus
                   transaction={transaction}
                   onNewDraw={handleNewDraw}
+                  onRetry={handleRetry}
+                  errorKind={errorKind}
                 />
               )}
             </>
